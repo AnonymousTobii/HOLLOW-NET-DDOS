@@ -1,18 +1,16 @@
-# Core L7 attacks (must‑have)
+# Core dependencies (install first)
 httpx[socks]
 cloudscraper
 requests
 beautifulsoup4
 urllib3
-
-# TUI (optional – omit if you want only simple logging)
 rich
+pysocks
 
-# Raw socket attacks (only if you have root & libpcap)
+# Optional: required for raw socket attacks (root + libpcap)
 # scapy
-# pysocks
 
-# Amplification APIs (optional)
+# Optional: for advanced origin discovery
 # shodan
 # censys
 # dnsdumpster
