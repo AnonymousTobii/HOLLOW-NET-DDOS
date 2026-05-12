@@ -14,7 +14,7 @@ import sys, os, time, re, random, json, logging, signal, argparse, socket, struc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Thread, Lock, Event
 from queue import Queue
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Tuple
 from urllib.parse import urlparse, urljoin
 
 # ---------- Optional imports ----------
