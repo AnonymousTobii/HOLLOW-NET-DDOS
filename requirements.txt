@@ -1,0 +1,18 @@
+# Core L7 attacks (must‑have)
+httpx[socks]
+cloudscraper
+requests
+beautifulsoup4
+urllib3
+
+# TUI (optional – omit if you want only simple logging)
+rich
+
+# Raw socket attacks (only if you have root & libpcap)
+# scapy
+# pysocks
+
+# Amplification APIs (optional)
+# shodan
+# censys
+# dnsdumpster
