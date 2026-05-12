@@ -1,0 +1,16 @@
+# Core dependencies (install first)
+httpx[socks]
+cloudscraper
+requests
+beautifulsoup4
+urllib3
+rich
+pysocks
+
+# Optional: required for raw socket attacks (root + libpcap)
+# scapy
+
+# Optional: for advanced origin discovery
+# shodan
+# censys
+# dnsdumpster
