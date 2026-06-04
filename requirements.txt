@@ -1,16 +1,19 @@
-# Core dependencies (install first)
+# HOLLOW-NET-DDOS v2.0 Professional Requirements
+# Core
 httpx[socks]
 cloudscraper
 requests
 beautifulsoup4
-urllib3
 rich
 pysocks
+pyyaml  # For professional config profiles
+pandas  # For advanced reporting and stats export
 
-# Optional: required for raw socket attacks (root + libpcap)
-# scapy
+# Optional Elite
+scapy  # Raw socket power (root required)
+shodan
+censys
+python-dns  # For advanced DNS ops
 
-# Optional: for advanced origin discovery
-# shodan
-# censys
-# dnsdumpster
+# OPSEC & Stealth
+cryptography  # For log encryption
